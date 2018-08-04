@@ -10,6 +10,7 @@ using System.Linq;
 using System.Net.Http;
 using System.Reflection;
 using System.Text;
+using System.Xml;
 
 namespace Jering.Quickwrap
 {
@@ -27,6 +28,8 @@ namespace Jering.Quickwrap
             string outputNamespace = "Jering.IocServices.System.Net.Http";
             Type httpClientType = typeof(HttpClient);
 
+            HttpClient test = new HttpClient();
+
             // Get public methods and properties
             List<MethodInfo> methodInfos = GetMethodInfos(httpClientType);
             List<PropertyInfo> propertyInfos = GetPropertyInfos(httpClientType);
@@ -39,9 +42,31 @@ namespace Jering.Quickwrap
             namespaceNames.Add(httpClientType.Namespace);
 
             // Create interface and class
-            // TODO xml comments?
+            XmlDocument documentation = GetDocumentation(httpClientType);
             string interfaceAsString = CreateInterface(outputNamespace, httpClientType, namespaceNames, methodInfos, propertyInfos);
             string classAsString = CreateClass(outputNamespace, httpClientType, namespaceNames, methodInfos, propertyInfos);
+        }
+
+        static XmlDocument GetDocumentation(Type type)
+        {
+            Assembly assembly = type.GetTypeInfo().Assembly;
+            string dllPath = type.GetTypeInfo().Assembly.Location;
+            string documentationPath = dllPath.Substring(0, dllPath.LastIndexOf('.') + 1) + "xml";
+
+            // System.* assemblies are loaded from "Program Files (x86)/dotnet/shared/Microsoft.NETCore.App/<version>" instead of from
+            // Nuget packages, so their comments aren't available.
+            if (!File.Exists(documentationPath))
+            {
+                return null;
+            }
+
+            var xmlDocument = new XmlDocument();
+            using (FileStream fileStream = File.OpenRead(documentationPath))
+            {
+                xmlDocument.Load(fileStream);
+            }
+
+            return xmlDocument;
         }
 
         static string CreateClass(string outputNamespace, Type type, HashSet<string> namespaceNames, List<MethodInfo> methodInfos, List<PropertyInfo> propertyInfos)
@@ -53,7 +78,7 @@ namespace Jering.Quickwrap
             memberDeclarations = memberDeclarations.Concat(methodInfos.Select(CreateMethod));
 
             // If there are any non-static methods, create an instance of the type
-            if(methodInfos.Any(methodInfo => !methodInfo.IsStatic))
+            if (methodInfos.Any(methodInfo => !methodInfo.IsStatic))
             {
                 SyntaxNode typeSyntax = CreateTypeSyntax(type);
 
@@ -75,7 +100,7 @@ namespace Jering.Quickwrap
             }
 
             // Class
-            SyntaxNode classDeclaration = _syntaxGenerator.ClassDeclaration($"{type.Name}Service", accessibility: Accessibility.Public, interfaceTypes: new SyntaxNode[] { SyntaxFactory.ParseTypeName($"I{type.Name}Service") }, 
+            SyntaxNode classDeclaration = _syntaxGenerator.ClassDeclaration($"{type.Name}Service", accessibility: Accessibility.Public, interfaceTypes: new SyntaxNode[] { SyntaxFactory.ParseTypeName($"I{type.Name}Service") },
                 members: memberDeclarations);
 
             // Namespace
@@ -103,8 +128,27 @@ namespace Jering.Quickwrap
             string declaringTypeName = propertyInfo.DeclaringType.Name;
             string fieldName = $"_{char.ToLowerInvariant(declaringTypeName[0])}{declaringTypeName.Substring(1)}";
 
+            SyntaxNode getStatement = null;
             SyntaxNode setStatement = null;
-            if (propertyInfo.SetMethod?.IsPublic == true)
+            DeclarationModifiers declarationModifiers = default(DeclarationModifiers);
+            // Property is public so it CanWrite and CanRead can't both be true
+            if (!propertyInfo.CanWrite)
+            {
+                declarationModifiers = DeclarationModifiers.ReadOnly;
+            }
+            else if (!propertyInfo.CanRead)
+            {
+                declarationModifiers = DeclarationModifiers.WriteOnly;
+            }
+
+            if (propertyInfo.CanRead)
+            {
+                SyntaxNode memberAccessExpression = _syntaxGenerator.MemberAccessExpression(_syntaxGenerator.IdentifierName(fieldName), propertyInfo.Name);
+                SyntaxNode returnStatement = _syntaxGenerator.ReturnStatement(memberAccessExpression);
+                getStatement = returnStatement;
+            }
+
+            if (propertyInfo.CanWrite)
             {
                 SyntaxNode memberAccessExpression = _syntaxGenerator.MemberAccessExpression(_syntaxGenerator.IdentifierName(fieldName), propertyInfo.Name);
                 SyntaxNode simpleAssignmentExpression = SyntaxFactory.AssignmentExpression(SyntaxKind.SimpleAssignmentExpression, (ExpressionSyntax)memberAccessExpression, (ExpressionSyntax)_syntaxGenerator.IdentifierName("value"));
@@ -112,7 +156,12 @@ namespace Jering.Quickwrap
             }
 
             // TODO create manually, use lambda staments for getters and setters
-            return _syntaxGenerator.PropertyDeclaration(propertyInfo.Name, CreateTypeSyntax(propertyInfo.DeclaringType), Accessibility.Public, setAccessorStatements: setStatement == null ? null : new SyntaxNode[] { setStatement });
+            return _syntaxGenerator.PropertyDeclaration(propertyInfo.Name,
+                CreateTypeSyntax(propertyInfo.PropertyType),
+                Accessibility.Public,
+                declarationModifiers,
+                setAccessorStatements: setStatement == null ? null : new SyntaxNode[] { setStatement },
+                getAccessorStatements: getStatement == null ? null : new SyntaxNode[] { getStatement });
         }
 
         static SyntaxNode CreateMethod(MethodInfo methodInfo)
@@ -191,7 +240,18 @@ namespace Jering.Quickwrap
 
         static SyntaxNode CreatePropertyDeclaration(PropertyInfo propertyInfo)
         {
-            return _syntaxGenerator.PropertyDeclaration(propertyInfo.Name, CreateTypeSyntax(propertyInfo.PropertyType));
+            DeclarationModifiers declarationModifiers = default(DeclarationModifiers);
+            // Property is public so it CanWrite and CanRead can't both be true
+            if (!propertyInfo.CanWrite)
+            {
+                declarationModifiers = DeclarationModifiers.ReadOnly;
+            }
+            else if (!propertyInfo.CanRead)
+            {
+                declarationModifiers = DeclarationModifiers.WriteOnly;
+            }
+
+            return _syntaxGenerator.PropertyDeclaration(propertyInfo.Name, CreateTypeSyntax(propertyInfo.PropertyType), modifiers: declarationModifiers);
         }
 
         static SyntaxNode CreateMethodDeclaration(MethodInfo methodInfo)
