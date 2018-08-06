@@ -25,26 +25,24 @@ namespace Jering.Quickwrap
 
         static void Main(string[] args)
         {
-            string outputNamespace = "Jering.IocServices.System.Net.Http";
-            Type httpClientType = typeof(HttpClient);
-
-            HttpClient test = new HttpClient();
+            string outputNamespace = "Jering.IocServices.System.IO";
+            Type type = typeof(File);
 
             // Get public methods and properties
-            List<MethodInfo> methodInfos = GetMethodInfos(httpClientType);
-            List<PropertyInfo> propertyInfos = GetPropertyInfos(httpClientType);
+            List<MethodInfo> methodInfos = GetMethodInfos(type);
+            List<PropertyInfo> propertyInfos = GetPropertyInfos(type);
 
             // Get namespaceNames used in public method and property declarations
             HashSet<string> namespaceNames = GetNamesOfNamespacesUsed(methodInfos, propertyInfos);
 
             // Include namespace of current type
             // TODO remove redundant namespaces?
-            namespaceNames.Add(httpClientType.Namespace);
+            namespaceNames.Add(type.Namespace);
 
             // Create interface and class
-            XmlDocument documentation = GetDocumentation(httpClientType);
-            string interfaceAsString = CreateInterface(outputNamespace, httpClientType, namespaceNames, methodInfos, propertyInfos);
-            string classAsString = CreateClass(outputNamespace, httpClientType, namespaceNames, methodInfos, propertyInfos);
+            XmlDocument documentation = GetDocumentation(type);
+            string interfaceAsString = CreateInterface(outputNamespace, type, namespaceNames, methodInfos, propertyInfos);
+            string classAsString = CreateClass(outputNamespace, type, namespaceNames, methodInfos, propertyInfos);
         }
 
         static XmlDocument GetDocumentation(Type type)
@@ -55,6 +53,21 @@ namespace Jering.Quickwrap
 
             // System.* assemblies are loaded from "Program Files (x86)/dotnet/shared/Microsoft.NETCore.App/<version>" instead of from
             // Nuget packages, so their comments aren't available.
+
+            // If this reflection based method is going to work, it will be necessary to dig through the whole system around Microsoft.NetCore.App.
+            // Documentation on how it all works is patchy at best.
+            // - How are assemblies in the metapackage related to those in out of bound packages? How are the assemblies versioned?
+            //   - The trail of dependencies for Microsoft.NETCore.App runs cold at Microsoft.NETCore.Platforms, there is no indication of dependencies on the standalone packages (for netcoreapp2.1).
+            // - Can assemblies be included directly from the metapackage instead of from dotnet/shared?
+            //   - Will have to look through how msbuild is resolving packages, can't find any information on this.
+            // - What is their rationale for changing things from project.json times when you simply referenced the metapackages?
+            // Misc links:
+            // https://gist.github.com/dsplaisted/83d67bbcff9ec1d0aff1bea1bf4ad79a
+            // https://github.com/dsplaisted/ReferenceAssemblyPackages
+            // https://github.com/dotnet/core/blob/master/release-notes/1.0/sdk/1.0-rc3-implicit-package-refs.md
+            //
+            // It might be too much of a mess, in which case it would be better to just clone the whole repo and generate ioc wrappers from the source code.
+
             if (!File.Exists(documentationPath))
             {
                 return null;
@@ -164,6 +177,7 @@ namespace Jering.Quickwrap
                 getAccessorStatements: getStatement == null ? null : new SyntaxNode[] { getStatement });
         }
 
+        // TODO async methods, default arg values
         static SyntaxNode CreateMethod(MethodInfo methodInfo)
         {
             SyntaxNode returnType = CreateTypeSyntax(methodInfo.ReturnType);
@@ -177,7 +191,17 @@ namespace Jering.Quickwrap
             SyntaxNode statement = null;
             if (methodInfo.IsStatic)
             {
-                // TODO call static method
+                SyntaxNode memberAccessExpression = _syntaxGenerator.MemberAccessExpression(_syntaxGenerator.IdentifierName(methodInfo.DeclaringType.Name), methodInfo.Name);
+                SyntaxNode invocationExpression = _syntaxGenerator.InvocationExpression(memberAccessExpression, arguments);
+
+                if (methodInfo.ReturnType == typeof(void))
+                {
+                    statement = invocationExpression;
+                }
+                else
+                {
+                    statement = _syntaxGenerator.ReturnStatement(invocationExpression);
+                }
             }
             else
             {
