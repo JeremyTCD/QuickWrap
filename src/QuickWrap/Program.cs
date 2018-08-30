@@ -1,4 +1,4 @@
-﻿ using Microsoft.CodeAnalysis;
+﻿using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Editing;
@@ -6,10 +6,8 @@ using Microsoft.CodeAnalysis.Formatting;
 using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Net.Http;
 using System.Reflection;
 using System.Text;
 using System.Xml;
@@ -33,9 +31,10 @@ namespace Jering.Quickwrap
             // Get public methods and properties
             List<MethodInfo> methodInfos = GetMethodInfos(type);
             List<PropertyInfo> propertyInfos = GetPropertyInfos(type);
+            List<EventInfo> eventInfos = GetEventInfos(type);
 
             // Get namespaceNames used in public method and property declarations
-            HashSet<string> namespaceNames = GetNamesOfNamespacesUsed(methodInfos, propertyInfos);
+            HashSet<string> namespaceNames = GetNamesOfNamespacesUsed(methodInfos, propertyInfos, eventInfos);
 
             // Include namespace of current type
             // TODO remove redundant namespaces?
@@ -43,8 +42,8 @@ namespace Jering.Quickwrap
 
             // Create interface and class
             XmlDocument documentation = GetDocumentation(type);
-            string interfaceAsString = CreateInterface(outputNamespace, type, namespaceNames, methodInfos, propertyInfos);
-            string classAsString = CreateClass(outputNamespace, type, namespaceNames, methodInfos, propertyInfos);
+            string interfaceAsString = CreateInterface(outputNamespace, type, namespaceNames, methodInfos, propertyInfos, eventInfos);
+            string classAsString = CreateClass(outputNamespace, type, namespaceNames, methodInfos, propertyInfos, eventInfos);
         }
 
         static XmlDocument GetDocumentation(Type type)
@@ -84,30 +83,84 @@ namespace Jering.Quickwrap
             return xmlDocument;
         }
 
-        static string CreateClass(string outputNamespace, Type type, HashSet<string> namespaceNames, List<MethodInfo> methodInfos, List<PropertyInfo> propertyInfos)
+        static string CreateClass(string outputNamespace, Type type, HashSet<string> namespaceNames, List<MethodInfo> methodInfos, List<PropertyInfo> propertyInfos, List<EventInfo> eventInfos)
         {
+            SyntaxNode underlyingTypeSyntax = CreateTypeSyntax(type);
+            string underlyingTypeName = type.Name;
+            string underlyingTypeFieldName = $"_{char.ToLowerInvariant(underlyingTypeName[0])}{underlyingTypeName.Substring(1)}";
+
+            // Events and methods may require statements in the constructor
+            List<SyntaxNode> constructorStatements = new List<SyntaxNode>();
+
+            // Events
+            IEnumerable<SyntaxNode> memberDeclarations = eventInfos.Select(CreateEvent);
+
             // Properties
-            IEnumerable<SyntaxNode> memberDeclarations = propertyInfos.Select(CreateProperty);
+            memberDeclarations = memberDeclarations.Concat(propertyInfos.Select(CreateProperty));
 
             // Methods
             memberDeclarations = memberDeclarations.Concat(methodInfos.Select(CreateMethod));
 
-            // If there are any non-static methods, create an instance of the type
-            if (methodInfos.Any(methodInfo => !methodInfo.IsStatic))
+            // If there are any non-static methods or events, create an instance of the type
+            if (methodInfos.Any(methodInfo => !methodInfo.IsStatic) || eventInfos.Count > 0)
             {
-                SyntaxNode typeSyntax = CreateTypeSyntax(type);
+                // Initialize default instance in constructor
+                SyntaxNode objectCreationExpression = _syntaxGenerator.ObjectCreationExpression(underlyingTypeSyntax);
+                // _syntaxGenerator.AssignmentStatement parenthesizes the right operand - https://github.com/dotnet/roslyn/blob/master/src/Workspaces/CSharp/Portable/CodeGeneration/CSharpSyntaxGenerator.cs#L3794
+                SyntaxNode simpleAssignmentExpression = SyntaxFactory.AssignmentExpression(SyntaxKind.SimpleAssignmentExpression, (ExpressionSyntax)_syntaxGenerator.IdentifierName(underlyingTypeFieldName), (ExpressionSyntax)objectCreationExpression);
+                SyntaxNode expressionStatement = _syntaxGenerator.ExpressionStatement(simpleAssignmentExpression);
 
-                // Field
-                string typeName = type.Name;
-                string fieldName = $"_{char.ToLowerInvariant(typeName[0])}{typeName.Substring(1)}";
-                SyntaxNode fieldDeclaration = _syntaxGenerator.FieldDeclaration(fieldName, typeSyntax, Accessibility.Private);
+                constructorStatements.Add(expressionStatement);
+            }
+
+            // Register anon methods for delegates
+            if (eventInfos.Count > 0)
+            {
+                // Register delegates
+                foreach (EventInfo eventInfo in eventInfos)
+                {
+                    // We need the invoke method of the delegate type to figure out its parameters
+                    MethodInfo invokeMethod = eventInfo.EventHandlerType.GetMethod("Invoke");
+                    ParameterInfo[] parameterInfos = invokeMethod.GetParameters();
+
+                    // Args for invoking the delegate
+                    SyntaxNode[] invocationArgs = new SyntaxNode[parameterInfos.Length];
+                    for (int i = 0; i < invocationArgs.Length; i++)
+                    {
+                        invocationArgs[i] = _syntaxGenerator.IdentifierName(parameterInfos[i].Name);
+                    }
+
+                    // Delegate invocation
+                    SyntaxNode memberBindingExpression = SyntaxFactory.MemberBindingExpression((SimpleNameSyntax)_syntaxGenerator.IdentifierName("Invoke"));
+                    SyntaxNode conditionalAccessExpression = SyntaxFactory.ConditionalAccessExpression(
+                        (ExpressionSyntax)_syntaxGenerator.IdentifierName(eventInfo.Name),
+                        (ExpressionSyntax)_syntaxGenerator.InvocationExpression(memberBindingExpression, invocationArgs)
+                    );
+
+                    // Anonymous method that invokes the delegate
+                    SyntaxNode[] anonMethodParams = new SyntaxNode[parameterInfos.Length];
+                    for (int i = 0; i < invocationArgs.Length; i++)
+                    {
+                        anonMethodParams[i] = _syntaxGenerator.ParameterDeclaration(parameterInfos[i].Name, CreateTypeSyntax(parameterInfos[i].ParameterType));
+                    }
+                    SyntaxNode parenthesizedLamdaExpression = SyntaxFactory.ParenthesizedLambdaExpression(SyntaxFactory.ParameterList(SyntaxFactory.SeparatedList(anonMethodParams)), (CSharpSyntaxNode)conditionalAccessExpression);
+
+                    // Compound assignment for delegate
+                    SyntaxNode memberAccessExpression = _syntaxGenerator.MemberAccessExpression(_syntaxGenerator.IdentifierName(underlyingTypeFieldName), _syntaxGenerator.IdentifierName(eventInfo.Name));
+                    SyntaxNode addAnonMethodToDelegateExpression = SyntaxFactory.AssignmentExpression(SyntaxKind.AddAssignmentExpression, (ExpressionSyntax)memberAccessExpression, (ExpressionSyntax)parenthesizedLamdaExpression);
+
+                    constructorStatements.Add(addAnonMethodToDelegateExpression);
+                }
+            }
+
+            // Constructor and default instance
+            if (constructorStatements.Count > 0)
+            {
+                // Default instance field
+                SyntaxNode fieldDeclaration = _syntaxGenerator.FieldDeclaration(underlyingTypeFieldName, underlyingTypeSyntax, Accessibility.Private);
 
                 // Constructor
-                SyntaxNode objectCreationExpression = _syntaxGenerator.ObjectCreationExpression(typeSyntax);
-                // _syntaxGenerator.AssignmentStatement parenthesizes the right operand - https://github.com/dotnet/roslyn/blob/master/src/Workspaces/CSharp/Portable/CodeGeneration/CSharpSyntaxGenerator.cs#L3794
-                SyntaxNode simpleAssignmentExpression = SyntaxFactory.AssignmentExpression(SyntaxKind.SimpleAssignmentExpression, (ExpressionSyntax)_syntaxGenerator.IdentifierName(fieldName), (ExpressionSyntax)objectCreationExpression);
-                SyntaxNode expressionStatement = _syntaxGenerator.ExpressionStatement(simpleAssignmentExpression);
-                SyntaxNode constructorDeclaration = _syntaxGenerator.ConstructorDeclaration(typeName, accessibility: Accessibility.Public, statements: new SyntaxNode[] { expressionStatement });
+                SyntaxNode constructorDeclaration = _syntaxGenerator.ConstructorDeclaration(underlyingTypeName, accessibility: Accessibility.Public, statements: constructorStatements);
 
                 // Add declarations to class
                 memberDeclarations = memberDeclarations.Prepend(constructorDeclaration);
@@ -243,8 +296,16 @@ namespace Jering.Quickwrap
             return _syntaxGenerator.MethodDeclaration(methodInfo.Name, parameters, typeArgumentNames, returnType, Accessibility.Public, statements: new SyntaxNode[] { statement });
         }
 
-        static string CreateInterface(string outputNamespace, Type type, HashSet<string> namespaceNames, List<MethodInfo> methodInfos, List<PropertyInfo> propertyInfos)
+        static SyntaxNode CreateEvent(EventInfo eventInfo)
         {
+            return _syntaxGenerator.EventDeclaration(eventInfo.Name, CreateTypeSyntax(eventInfo.EventHandlerType), Accessibility.Public);
+        }
+
+        static string CreateInterface(string outputNamespace, Type type, HashSet<string> namespaceNames, List<MethodInfo> methodInfos, List<PropertyInfo> propertyInfos, List<EventInfo> eventInfos)
+        {
+            // Events
+            IEnumerable<SyntaxNode> eventDeclarations = eventInfos.Select(CreateEventDeclaration);
+
             // Properties
             IEnumerable<SyntaxNode> propertyDeclarations = propertyInfos.Select(CreatePropertyDeclaration);
 
@@ -252,7 +313,7 @@ namespace Jering.Quickwrap
             IEnumerable<SyntaxNode> methodDeclarations = methodInfos.Select(CreateMethodDeclaration);
 
             // Class
-            SyntaxNode interfaceDeclaration = _syntaxGenerator.InterfaceDeclaration($"I{type.Name}Service", accessibility: Accessibility.Public, members: propertyDeclarations.Concat(methodDeclarations));
+            SyntaxNode interfaceDeclaration = _syntaxGenerator.InterfaceDeclaration($"I{type.Name}Service", accessibility: Accessibility.Public, members: propertyDeclarations.Concat(methodDeclarations).Concat(eventDeclarations));
 
             // Namespace
             NamespaceDeclarationSyntax namespaceDeclaration = (NamespaceDeclarationSyntax)_syntaxGenerator.NamespaceDeclaration(outputNamespace, interfaceDeclaration);
@@ -272,6 +333,11 @@ namespace Jering.Quickwrap
             }
 
             return stringBuilder.ToString();
+        }
+
+        static SyntaxNode CreateEventDeclaration(EventInfo eventInfo)
+        {
+            return _syntaxGenerator.EventDeclaration(eventInfo.Name, CreateTypeSyntax(eventInfo.EventHandlerType));
         }
 
         static SyntaxNode CreatePropertyDeclaration(PropertyInfo propertyInfo)
@@ -360,6 +426,26 @@ namespace Jering.Quickwrap
             return result;
         }
 
+        static List<EventInfo> GetEventInfos(Type type)
+        {
+            List<EventInfo> result = new List<EventInfo>();
+
+            // Add event infos
+            EventInfo[] publicProperties = type.GetEvents(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly);
+            foreach (EventInfo publicEvent in publicProperties)
+            {
+                // TODO what kinds of events have special names?
+                if (publicEvent.IsSpecialName)
+                {
+                    continue;
+                }
+
+                result.Add(publicEvent);
+            }
+
+            return result;
+        }
+
         static List<PropertyInfo> GetPropertyInfos(Type type)
         {
             List<PropertyInfo> result = new List<PropertyInfo>();
@@ -380,9 +466,15 @@ namespace Jering.Quickwrap
             return result;
         }
 
-        static HashSet<string> GetNamesOfNamespacesUsed(IEnumerable<MethodInfo> methodInfos, IEnumerable<PropertyInfo> propertyInfos)
+        static HashSet<string> GetNamesOfNamespacesUsed(IEnumerable<MethodInfo> methodInfos, IEnumerable<PropertyInfo> propertyInfos, IEnumerable<EventInfo> eventInfos)
         {
             HashSet<string> result = new HashSet<string>();
+
+            foreach (EventInfo eventInfo in eventInfos)
+            {
+                // Add namespaceNames for event handler type
+                AddnamespaceNamesUsed(result, eventInfo.EventHandlerType);
+            }
 
             foreach (MethodInfo methodInfo in methodInfos)
             {
