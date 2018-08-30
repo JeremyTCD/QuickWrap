@@ -1,10 +1,12 @@
-﻿using Microsoft.CodeAnalysis;
+﻿ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Editing;
 using Microsoft.CodeAnalysis.Formatting;
+using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
@@ -25,8 +27,8 @@ namespace Jering.Quickwrap
 
         static void Main(string[] args)
         {
-            string outputNamespace = "Jering.IocServices.System.IO";
-            Type type = typeof(File);
+            string outputNamespace = "Jering.IocServices.Newtonsoft.Json";
+            Type type = typeof(JsonSerializer);
 
             // Get public methods and properties
             List<MethodInfo> methodInfos = GetMethodInfos(type);
@@ -188,10 +190,19 @@ namespace Jering.Quickwrap
                 arguments.Add(_syntaxGenerator.Argument(_syntaxGenerator.IdentifierName(parameterInfo.Name)));
             }
 
+            string[] typeArgumentNames = null;
+            SyntaxNode[] typeArguments = null;
+            if (methodInfo.IsGenericMethod)
+            {
+                typeArgumentNames = methodInfo.GetGenericArguments().Select(type => type.Name).ToArray();
+                typeArguments = typeArgumentNames.Select(name => _syntaxGenerator.IdentifierName(name)).ToArray();
+            }
+
             SyntaxNode statement = null;
             if (methodInfo.IsStatic)
             {
-                SyntaxNode memberAccessExpression = _syntaxGenerator.MemberAccessExpression(_syntaxGenerator.IdentifierName(methodInfo.DeclaringType.Name), methodInfo.Name);
+                SyntaxNode memberExpression = typeArguments == null ? _syntaxGenerator.IdentifierName(methodInfo.Name) : _syntaxGenerator.GenericName(methodInfo.Name, typeArguments);
+                SyntaxNode memberAccessExpression = _syntaxGenerator.MemberAccessExpression(_syntaxGenerator.IdentifierName(methodInfo.DeclaringType.Name), memberExpression);
                 SyntaxNode invocationExpression = _syntaxGenerator.InvocationExpression(memberAccessExpression, arguments);
 
                 if (methodInfo.ReturnType == typeof(void))
@@ -207,7 +218,8 @@ namespace Jering.Quickwrap
             {
                 string declaringTypeName = methodInfo.DeclaringType.Name;
                 string fieldName = $"_{char.ToLowerInvariant(declaringTypeName[0])}{declaringTypeName.Substring(1)}";
-                SyntaxNode memberAccessExpression = _syntaxGenerator.MemberAccessExpression(_syntaxGenerator.IdentifierName(fieldName), methodInfo.Name);
+                SyntaxNode memberExpression = typeArguments == null ? _syntaxGenerator.IdentifierName(methodInfo.Name) : _syntaxGenerator.GenericName(methodInfo.Name, typeArguments);
+                SyntaxNode memberAccessExpression = _syntaxGenerator.MemberAccessExpression(_syntaxGenerator.IdentifierName(fieldName), memberExpression);
                 SyntaxNode invocationExpression = _syntaxGenerator.InvocationExpression(memberAccessExpression, arguments);
 
                 if (methodInfo.ReturnType == typeof(void))
@@ -228,7 +240,7 @@ namespace Jering.Quickwrap
                 parameters.Add(_syntaxGenerator.ParameterDeclaration(parameterInfo.Name, CreateTypeSyntax(parameterInfo.ParameterType)));
             }
 
-            return _syntaxGenerator.MethodDeclaration(methodInfo.Name, parameters, returnType: returnType, accessibility: Accessibility.Public, statements: new SyntaxNode[] { statement });
+            return _syntaxGenerator.MethodDeclaration(methodInfo.Name, parameters, typeArgumentNames, returnType, Accessibility.Public, statements: new SyntaxNode[] { statement });
         }
 
         static string CreateInterface(string outputNamespace, Type type, HashSet<string> namespaceNames, List<MethodInfo> methodInfos, List<PropertyInfo> propertyInfos)
@@ -286,11 +298,16 @@ namespace Jering.Quickwrap
             foreach (ParameterInfo parameterInfo in methodInfo.GetParameters())
             {
                 // TODO initializer (default values)
-                // TODO type parameters
                 parameters.Add(_syntaxGenerator.ParameterDeclaration(parameterInfo.Name, CreateTypeSyntax(parameterInfo.ParameterType)));
             }
 
-            return _syntaxGenerator.MethodDeclaration(methodInfo.Name, parameters, returnType: returnType);
+            string[] typeParameters = null;
+            if (methodInfo.IsGenericMethod)
+            {
+                typeParameters = methodInfo.GetGenericArguments().Select(type => type.Name).ToArray();
+            }
+
+            return _syntaxGenerator.MethodDeclaration(methodInfo.Name, parameters, typeParameters, returnType);
         }
 
         /// <summary>
